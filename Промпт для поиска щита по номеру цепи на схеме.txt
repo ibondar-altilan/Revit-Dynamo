@@ -1,0 +1,298 @@
+Привет! Мы продолжаем разработку и кастомизацию скрипта автоматизации для Revit 2023. 
+Пожалуйста, строго придерживайся следующих вводных данных и технических ограничений:
+
+1. ЦЕЛЕВАЯ ПЛАТФОРМА И ДВИЖОК:
+   - Revit 2023, Dynamo (нод Python Script).
+   - Движок: CPython 3.
+   - Метод получения ID элементов: СТРОГО .IntegerValue (свойство .Value НЕ поддерживается, так как оно появилось только в Revit 2024).
+
+2. АЛГОРИТМ И ЛОГИКА СКРИПТА:
+   - Скрипт принимает на вход экземпляр семейства (FamilyInstance) автоматического выключателя серий "TSL_2D...".
+   - Считывает параметр "Принадлежность щиту".
+   - Ищет в проекте щит (категория OST_ElectricalEquipment) через FilteredElementCollector, у которого параметр "Имя панели" совпадает со считанным значением.
+   - Определяет текстовый параметр "Уровень" у найденного щита.
+   - Ищет подходящие планы этажей (ViewPlan) для этого уровня (сравнивает имя уровня вида с уровнем щита).
+   - Переключает активный вид в Revit на найденный план через uidoc.RequestViewChange(target_view).
+
+3. ТРЕБОВАНИЯ К ИНТЕРФЕЙСУ (WPF):
+   - Если подходящих видов найдено несколько, вызывается кастомное модальное WPF-окно (Windows Presentation Foundation) с динамическим количеством кнопок (по кнопке на каждый вид).
+   - Нажатие на кнопку закрывает окно и передает выбранный вид дальше.
+   - КРИТИЧНО: Если пользователь закрывает окно на "крестик" (без нажатия кнопок), скрипт должен вызывать `raise Exception("...")`, полностью прерывая выполнение всей цепочки Dynamo.
+
+4. СТИЛЬ И ЧИСТОТА КОДА:
+   - В коде НЕ должно быть отладочного мусора (массивов `debug = []`, логов `debug.append`).
+   - Паттерн обработки ошибок: Ранний выход (Early Exit) через генерацию системных исключений (raise Exception).
+   - Выходной порт OUT должен отдавать чистую структуру данных: [result_data (словарь), panel_element, target_view].
+
+Вот актуальная рабочая версия нашего кода, от которой мы отталкиваемся:
+[ВСТАВЬТЕ СЮДА ВАШ ТЕКУЩИЙ ИСПРАВЛЕННЫЙ КОД ЦЕЛИКОМ]
+
+# -*- coding: utf-8 -*-
+import clr
+
+# Импорт необходимых библиотек Revit API
+clr.AddReference('RevitAPI')
+clr.AddReference('RevitAPIUI')
+from Autodesk.Revit.DB import *
+from Autodesk.Revit.UI import *
+
+# Импорт сервисов транзакций и документа
+clr.AddReference('RevitServices')
+from RevitServices.Persistence import DocumentManager
+from RevitServices.Transactions import TransactionManager
+
+# Импорт расширений для конвертации элементов Revit/Dynamo
+clr.AddReference('RevitNodes')
+import Revit
+clr.ImportExtensions(Revit.Elements)
+
+# Подключение библиотек интерфейса Windows (WPF)
+clr.AddReference("PresentationFramework")
+clr.AddReference("PresentationCore")
+clr.AddReference("System.Windows")
+
+from System.Windows import Window, Thickness, HorizontalAlignment, SizeToContent, WindowStartupLocation
+from System.Windows.Controls import StackPanel, Button, TextBlock
+
+# Инициализация документа и UI-документа Revit
+doc = DocumentManager.Instance.CurrentDBDocument
+uidoc = DocumentManager.Instance.CurrentUIApplication.ActiveUIDocument
+
+# Класс окна выбора вида (Оптимизирован для CPython3)
+class DynamicButtonsWindow(Window):
+    def __init__(self, options_list):
+        self.Title = "Выбор вида"
+        self.Width = 450
+        # Использование прямых перечислений .NET вместо sys.modules
+        self.SizeToContent = SizeToContent.Height
+        self.WindowStartupLocation = WindowStartupLocation.CenterScreen
+        self.Topmost = True
+        
+        panel = StackPanel()
+        panel.Margin = Thickness(15)
+        
+        # Инструкция для пользователя
+        title_text = TextBlock()
+        title_text.Text = "Найдено несколько видов. Выберите один:"
+        title_text.Margin = Thickness(0, 0, 0, 15)
+        title_text.FontSize = 12
+        panel.Children.Add(title_text)
+# Переменная для записи выбора
+        self.selected_option = None
+        
+        # Генерируем кнопки динамически из списка
+        for option in options_list:
+            btn = Button()
+            btn.Content = str(option)
+            btn.Height = 35
+            btn.Margin = Thickness(0, 0, 0, 8)
+            btn.HorizontalAlignment = HorizontalAlignment.Stretch
+            btn.Click += self.on_button_click
+            panel.Children.Add(btn)
+            
+        self.Content = panel
+
+    def on_button_click(self, sender, e):
+        self.selected_option = sender.Content
+        self.Close()
+
+# Получение внутреннего Revit элемента (Очищено от дублирующих проверок)
+def get_revit_element(dynamo_element):
+    if not dynamo_element:
+        return None
+    if hasattr(dynamo_element, 'InternalElement'):
+        return dynamo_element.InternalElement
+    return dynamo_element
+
+# ОПТИМИЗИРОВАННОЕ получение текстового значения параметра (Без отладки)
+def get_parameter_value(element, param_name):
+    """Возвращает текстовое представление значения параметра для Revit 2023"""
+    revit_element = get_revit_element(element)
+    if not revit_element:
+        return None
+    
+    param = revit_element.LookupParameter(param_name)
+    if not param or not param.HasValue:
+        return None
+    
+    # Быстрая обработка в зависимости от типа данных в БД Revit
+    st = param.StorageType
+    
+    if st == StorageType.String:
+        return param.AsString() # Возвращает чистую строку
+        
+    elif st == StorageType.Integer:
+        return str(param.AsInteger())
+        
+    elif st == StorageType.Double:
+        # Если нужен текст с единицами проекта (например, 1500 мм), раскомментируйте AsValueString()
+        # В противном случае AsDouble() вернет число в футах
+        val_string = param.AsValueString()
+        return val_string if val_string else str(param.AsDouble())
+        
+    elif st == StorageType.ElementId:
+        elem_id = param.AsElementId()
+        # Проверка на валидность ID (что это не пустая ссылка -1)
+        if elem_id and elem_id != ElementId.InvalidElementId:
+            ref_element = doc.GetElement(elem_id)
+            if ref_element:
+                return ref_element.Name # Быстрое и универсальное получение имени элемента в Revit API
+                
+    return None
+# Функция переключения вида
+def switch_to_view(target_view):
+    """Переключает активный вид в Revit"""
+    if not target_view:
+        return False, "Вид не передан"
+    
+    # Безопасное закрытие транзакций Dynamo перед переключением вида
+    TransactionManager.Instance.ForceCloseTransaction()
+    
+    # Запрашиваем смену вида (асинхронный метод Revit API)
+    uidoc.RequestViewChange(target_view)
+    return True, f"Вид переключен на: {target_view.Name}"
+
+
+# --- ШАГ 1-2: ВАЛИДАЦИЯ ВХОДНЫХ ДАННЫХ (Ранний выход) ---
+if not IN or IN[0] is None:
+    raise Exception("Ошибка: На вход IN[0] не подан элемент.")
+
+input_element = IN[0]
+revit_input = get_revit_element(input_element)
+
+if not revit_input:
+    raise Exception("Ошибка: Не удалось получить внутренний элемент Revit.")
+
+# --- ШАГ 3-4: ПРОВЕРКА СЕМЕЙСТВА ---
+# Проверяем, является ли элемент экземпляром семейства (FamilyInstance)
+if isinstance(revit_input, FamilyInstance):
+    family_symbol = revit_input.Symbol
+    if family_symbol and family_symbol.Family:
+        family_name = family_symbol.Family.Name
+        allowed_families = ["TSL_2D автоматический выключатель_ВРУ", "TSL_2D автоматический выключатель_Щит"]
+        
+        if family_name not in allowed_families:
+            raise Exception(f"Ошибка: Семейство '{family_name}' не разрешено для этого скрипта.")
+    else:
+        raise Exception("Ошибка: Не удалось определить семейство элемента.")
+else:
+    raise Exception("Ошибка: Выбранный элемент не является экземпляром семейства.")
+
+# --- ШАГ 5: ЧТЕНИЕ ПАРАМЕТРА ПРИНАДЛЕЖНОСТИ ---
+panel_belonging = get_parameter_value(revit_input, "Принадлежность щиту")
+if not panel_belonging:
+    raise Exception("Ошибка: Параметр 'Принадлежность щиту' пуст или отсутствует у элемента.")
+
+# Убираем пробелы и приводим к нижнему регистру для точного сравнения
+panel_belonging_clean = panel_belonging.strip().lower()
+
+
+# --- ШАГ 6: ОПТИМИЗИРОВАННЫЙ ПОИСК ЩИТА (Revit API) ---
+# Ищем только экземпляры электрооборудования в проекте (без выгрузки лишних типов)
+collector = FilteredElementCollector(doc)\
+    .OfCategory(BuiltInCategory.OST_ElectricalEquipment)\
+    .WhereElementIsNotElementType()
+
+panel_element = None
+
+for elem in collector:
+    param_value = get_parameter_value(elem, "Имя панели")
+    if param_value and param_value.strip().lower() == panel_belonging_clean:
+        panel_element = elem
+        break # Нашли нужный щит — сразу выходим из цикла
+
+if not panel_element:
+    raise Exception(f"Ошибка: В проекте не найден щит с 'Имя панели' = '{panel_belonging}'.")
+
+
+# --- ШАГ 7: ПОЛУЧЕНИЕ УРОВНЯ ЩИТА ---
+level_name = get_parameter_value(panel_element, "Уровень")
+if not level_name:
+    raise Exception("Ошибка: У найденного щита параметр 'Уровень' пуст или отсутствует.")
+# --- ШАГ 8: ОПТИМИЗИРОВАННЫЙ ПОИСК ВИДОВ ДЛЯ УРОВНЯ ---
+level_name_clean = level_name.strip().lower()
+
+# Собираем только размещенные на листах/в проекте планы этажей (исключая типы)
+view_collector = FilteredElementCollector(doc)\
+    .OfClass(ViewPlan)\
+    .WhereElementIsNotElementType()
+
+found_views = []
+for view in view_collector:
+    # Исключаем шаблоны видов штатными средствами API
+    if view.IsTemplate or view.ViewType != ViewType.FloorPlan:
+        continue
+        
+    view_level = view.GenLevel
+    if not view_level:
+        continue
+        
+    # Быстрое получение имени уровня вида
+    level_param_name = view_level.Name
+    if level_param_name and level_param_name.strip().lower() == level_name_clean:
+        found_views.append(view)
+
+# Проверка результатов поиска
+if not found_views:
+    raise Exception(f"Ошибка: Не найдены планы этажей для уровня '{level_name}'.")
+
+target_view = None
+view_selection_message = ""
+
+# Логика выбора вида (Автоматически или через окно)
+if len(found_views) == 1:
+    target_view = found_views[0]
+    view_selection_message = f"Автоматически выбран единственный вид: {target_view.Name}"
+else:
+    # Если найдено несколько видов — выводим кастомное WPF окно
+    view_names = [v.Name for v in found_views]
+    
+    form = DynamicButtonsWindow(view_names)
+    form.ShowDialog()
+    
+    # КРИТИЧНО: Если пользователь закрыл окно на крестик — полностью прерываем скрипт
+    if form.selected_option is None:
+        raise Exception("Выполнение скрипта полностью отменено пользователем (окно закрыто).")
+        
+    # Находим выбранный вид по имени кнопки
+    selected_name = form.selected_option
+    for view in found_views:
+        if view.Name == selected_name:
+            target_view = view
+            break
+            
+    view_selection_message = f"Пользователем выбран вид: {selected_name}"
+
+# --- ШАГ 9: ПЕРЕКЛЮЧЕНИЕ ВИДА ---
+if target_view:
+    switch_success, switch_message = switch_to_view(target_view)
+else:
+    switch_success = False
+    switch_message = "Вид не был определен."
+
+
+# --- ФОРМИРОВАНИЕ ЧИСТОГО РЕЗУЛЬТАТА (OUT) ---
+# Для Revit 2023 используем строго .IntegerValue вместо .Value
+panel_id_value = panel_element.Id.IntegerValue
+panel_name = get_parameter_value(panel_element, "Имя панели") or "Не указано"
+panel_family = panel_element.Symbol.Family.Name if panel_element.Symbol else "Неизвестно"
+panel_type = panel_element.Name if panel_element else "Неизвестно"
+
+# Формируем компактный информационный словарь
+result_data = {
+    'panel_id': panel_id_value,
+    'panel_name': panel_name,
+    'panel_family': panel_family,
+    'panel_type': panel_type,
+    'panel_belonging': panel_belonging,
+    'level_name': level_name,
+    'view_name': target_view.Name if target_view else "Не найден",
+    # Здесь также возвращаем .IntegerValue для ID вида
+    'view_id': target_view.Id.IntegerValue if target_view else "Не найден",
+    'view_selection': view_selection_message,
+    'switch_status': switch_message if switch_success else "Переключение не выполнено"
+}
+
+# Возвращаем структурированные данные на выход нода Dynamo (Без отладочного мусора)
+OUT = [result_data, panel_element, target_view]
+
