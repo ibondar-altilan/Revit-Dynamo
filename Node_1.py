@@ -54,14 +54,19 @@ circuit_display_name = circuit_number.strip()
 circuit_number_clean = circuit_display_name.lower()
 
 # --- ШАГ 2: СБОР ТРАСС ПО ВСЕЙ МОДЕЛИ ---
-target_family_keyword = "TSL_GM_в_Участок трассы_Горизонтальный"
+target_family_keywords = [
+    "TSL_GM_в_Участок трассы_Горизонтальный",
+    "TSL_GM_в_Участок трассы_Вертикальный",
+]
 collector = FilteredElementCollector(doc).OfClass(FamilyInstance).WhereElementIsNotElementType()
 
 counted_elements = []
 
 for item in collector:
     if not item.Symbol or not item.Symbol.Family: continue
-    if target_family_keyword not in item.Symbol.Family.Name: continue
+    fam_name = item.Symbol.Family.Name
+    if not any(k in fam_name for k in target_family_keywords): 
+        continue
     
     tsl_circuit = get_parameter_value_string(item, "TSL_Номер питающей цепи")
     if circuit_number_clean in tsl_circuit.strip().lower():

@@ -21,6 +21,7 @@ from RevitServices.Transactions import TransactionManager
 clr.AddReference('System.Windows.Forms')
 clr.AddReference('System.Drawing')
 import System.Windows.Forms
+import System.Drawing
 
 from System.Collections.Generic import List
 
@@ -29,6 +30,7 @@ doc = DocumentManager.Instance.CurrentDBDocument
 PARAM_LENGTH = "Длина"
 PARAM_CABLE_LENGTH = "Длина проводника"
 PARAM_CIRCUIT_NUMBER = "Номер цепи"
+VERTICAL_TRACE_FAMILY_NAME = "TSL_GM_в_Участок трассы_Вертикальный"
 
 
 def get_uidoc():
@@ -93,8 +95,9 @@ def get_parameter_value_string(element, param_name):
 
 def read_length_meters(element):
     param = element.LookupParameter(PARAM_LENGTH)
-    if param is None or not param.HasValue or param.StorageType != StorageType.Double:
+    if param is None or not param.HasValue:
         return 0.0
+    # Параметр типа "Длина": Double во внутренних единицах Revit (футы).
     try:
         return UnitUtils.ConvertFromInternalUnits(param.AsDouble(), UnitTypeId.Meters)
     except Exception:
@@ -108,10 +111,32 @@ def calculate_total_length_meters(elements):
     return total
 
 
+def is_vertical_trace_instance(element):
+    try:
+        if not isinstance(element, FamilyInstance):
+            return False
+        symbol = element.Symbol
+        if symbol is None:
+            return False
+        fam = symbol.Family
+        fam_name = fam.Name if fam else ""
+        # Точное совпадение имени семейства с моделью.
+        return fam_name == VERTICAL_TRACE_FAMILY_NAME
+    except Exception:
+        return False
+
+
 def ceil_meters(value):
     if value <= 0.0:
         return 0
     return int(math.ceil(value - 1e-9))
+
+def format_meters_2dp(value):
+    try:
+        s = "{0:.2f}".format(float(value))
+    except Exception:
+        s = "0.00"
+    return s
 
 
 def select_elements(active_uidoc, elements):
@@ -159,37 +184,47 @@ def write_cable_length(breaker, length_meters):
 
 
 class ActionChoiceForm(System.Windows.Forms.Form):
-    def __init__(self, circuit_number, length_meters_rounded):
+    def __init__(self, circuit_number, length_meters_rounded, horizontal_length_meters, vertical_length_meters):
         self.action = "cancel"
         self.is_finished = False
 
         self.Text = "Действие с трассой"
-        self.Width = 500
-        self.Height = 250
+        # На 4K/HiDPI при масштабировании Windows фиксированная высота часто "режет" строки.
+        # Делаем высоту адаптивной по содержимому + ограничение по рабочей области экрана.
+        self.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Dpi
+        self.Width = 520
         self.StartPosition = System.Windows.Forms.FormStartPosition.CenterScreen
         self.TopMost = True
         self.FormBorderStyle = System.Windows.Forms.FormBorderStyle.FixedDialog
         self.MaximizeBox = False
         self.MinimizeBox = False
+        self.AutoScroll = True
 
         margin_x = 15
-        width = 450
+        width = self.Width - (margin_x * 2) - 20
         y = 15
 
         title = System.Windows.Forms.Label()
         title.Left = margin_x
         title.Top = y
         title.Width = width
-        title.Height = 45
+        title.AutoSize = True
+        # Чтобы AutoSize учитывал переносы по ширине.
+        title.MaximumSize = System.Drawing.Size(width, 0)
         title.Text = (
             "Цепь: {0}\r\n"
             "Расчетная длина трассы к записи: {1} м\r\n"
+            "Горизонтальные участки - {2} м\r\n"
+            "Вертикальные участки - {3} м\r\n"
             "Можно перейти на вид Revit для zoom/pan и проверки трассы.".format(
-                circuit_number, length_meters_rounded
+                circuit_number,
+                length_meters_rounded,
+                format_meters_2dp(horizontal_length_meters),
+                format_meters_2dp(vertical_length_meters),
             )
         )
         self.Controls.Add(title)
-        y += 70
+        y = title.Bottom + 15
 
         btn_write = System.Windows.Forms.Button()
         btn_write.Left = margin_x
@@ -209,6 +244,13 @@ class ActionChoiceForm(System.Windows.Forms.Form):
         btn_edit.Text = "Перейти к редактированию трассы"
         btn_edit.Click += self.on_edit
         self.Controls.Add(btn_edit)
+
+        # Подгоняем высоту окна так, чтобы все элементы были видны.
+        required_client_height = btn_edit.Bottom + 25
+        screen = System.Windows.Forms.Screen.FromPoint(System.Windows.Forms.Cursor.Position).WorkingArea
+        max_client_height = int(screen.Height * 0.90)
+        target_client_height = required_client_height if required_client_height < max_client_height else max_client_height
+        self.ClientSize = System.Drawing.Size(self.ClientSize.Width, target_client_height)
 
         self.FormClosed += self.on_closed
 
@@ -247,7 +289,12 @@ if not breaker_element:
     raise Exception("Ошибка: IN[2] не содержит исходный автомат.")
 
 circuit_number = get_parameter_value_string(breaker_element, PARAM_CIRCUIT_NUMBER).strip() or "—"
-raw_length = calculate_total_length_meters(trace_elements)
+vertical_elements = [el for el in trace_elements if is_vertical_trace_instance(el)]
+horizontal_elements = [el for el in trace_elements if not is_vertical_trace_instance(el)]
+
+horizontal_length = calculate_total_length_meters(horizontal_elements)
+vertical_length = calculate_total_length_meters(vertical_elements)
+raw_length = horizontal_length + vertical_length
 rounded_length = ceil_meters(raw_length)
 
 active_uidoc = get_uidoc()
@@ -258,7 +305,7 @@ wait_for_active_view(active_uidoc, active_view)
 TransactionManager.Instance.ForceCloseTransaction()
 select_elements(active_uidoc, trace_elements)
 
-form = ActionChoiceForm(circuit_number, rounded_length)
+form = ActionChoiceForm(circuit_number, rounded_length, horizontal_length, vertical_length)
 form.Show()
 
 while not form.is_finished:
