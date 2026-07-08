@@ -235,10 +235,10 @@ def write_max_length_to_breaker(breaker, length_m_ceil):
     TransactionManager.Instance.TransactionTaskDone()
 
 
-def show_result_window(message_text, allow_write):
-    """Показывает результат поверх всех окон. Возвращает 'write' или 'exit'."""
+def show_result_window(message_text, allow_write, is_modal, breaker=None, write_value_m=None):
+    """Показывает окно результата (модальное/немодальное)."""
     if not message_text:
-        return "exit"
+        return
 
     screen = System.Windows.Forms.Screen.FromPoint(System.Windows.Forms.Cursor.Position).WorkingArea
     margin = 16
@@ -317,7 +317,6 @@ def show_result_window(message_text, allow_write):
     btn_exit.Height = button_height
     btn_exit.Top = form.ClientSize.Height - margin - btn_exit.Height
     btn_exit.Anchor = System.Windows.Forms.AnchorStyles.Bottom
-    btn_exit.DialogResult = System.Windows.Forms.DialogResult.Cancel
     form.Controls.Add(btn_exit)
 
     btn_write = None
@@ -328,22 +327,44 @@ def show_result_window(message_text, allow_write):
         btn_write.Height = button_height
         btn_write.Top = form.ClientSize.Height - margin - btn_write.Height
         btn_write.Anchor = System.Windows.Forms.AnchorStyles.Bottom
-        btn_write.DialogResult = System.Windows.Forms.DialogResult.OK
         form.Controls.Add(btn_write)
         total_buttons_width = btn_write.Width + button_spacing + btn_exit.Width
         left_start = (form.ClientSize.Width - total_buttons_width) / 2
         btn_write.Left = left_start
         btn_exit.Left = btn_write.Right + button_spacing
-        form.AcceptButton = btn_write
     else:
         btn_exit.Left = (form.ClientSize.Width - btn_exit.Width) / 2
-        form.AcceptButton = btn_exit
 
-    form.CancelButton = btn_exit
-    dialog_result = form.ShowDialog()
-    if allow_write and dialog_result == System.Windows.Forms.DialogResult.OK:
-        return "write"
-    return "exit"
+    if is_modal:
+        btn_exit.DialogResult = System.Windows.Forms.DialogResult.Cancel
+        form.CancelButton = btn_exit
+        if allow_write and btn_write is not None:
+            btn_write.DialogResult = System.Windows.Forms.DialogResult.OK
+            form.AcceptButton = btn_write
+        else:
+            form.AcceptButton = btn_exit
+
+        dialog_result = form.ShowDialog()
+        if allow_write and dialog_result == System.Windows.Forms.DialogResult.OK:
+            if breaker is None or write_value_m is None:
+                raise Exception("Нет данных для записи.")
+            write_max_length_to_breaker(breaker, write_value_m)
+            System.Windows.Forms.MessageBox.Show(
+                "Записано {0} м в параметр '{1}'.".format(write_value_m, PARAM_MAX_CABLE_LENGTH),
+                "Запись длины",
+                System.Windows.Forms.MessageBoxButtons.OK,
+                System.Windows.Forms.MessageBoxIcon.Information
+            )
+        return
+
+    # Немодальный режим (при неуспешном расчете, без записи)
+    def on_exit_click(sender, args):
+        form.Close()
+
+    btn_exit.Click += on_exit_click
+    if btn_write is not None:
+        btn_write.Enabled = False
+    form.Show()
 
 
 def get_element_xy_point(element):
@@ -1037,15 +1058,20 @@ else:
     result_window_text = "\r\n".join(lines)
 
 try:
-    result_action = show_result_window(result_window_text, result_can_write)
-    if result_action == "write" and result_can_write and result_write_value_m is not None:
-        try:
-            write_max_length_to_breaker(revit_automatic, result_write_value_m)
-        except Exception as write_exc:
-            show_result_window(
-                "Ошибка записи в параметр '{0}':\r\n{1}".format(PARAM_MAX_CABLE_LENGTH, str(write_exc)),
-                False
-            )
+    if result_can_write:
+        show_result_window(
+            result_window_text,
+            True,
+            True,
+            revit_automatic,
+            result_write_value_m
+        )
+    else:
+        show_result_window(
+            result_window_text,
+            False,
+            False
+        )
 except:
     pass
 
