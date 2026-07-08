@@ -77,8 +77,11 @@ ALLOWED_CONSUMER_CATEGORIES_NORM = set([normalize_text(x) for x in ALLOWED_CONSU
 
 
 # --- ВХОДЫ ---
-if IN is None or len(IN) < 3:
-    raise Exception("Ошибка: ожидаются входы IN[0], IN[1], IN[2], IN[3]. Для этапа 1 обязателен IN[2] (автомат).")
+if IN is None or len(IN) < 5:
+    raise Exception(
+        "Ошибка: ожидаются входы IN[0], IN[1], IN[2], IN[3], IN[4]. "
+        "Для этапа 1 обязательны IN[2] (автомат), IN[3] (допуск привязки) и IN[4] (допуск склейки узлов)."
+    )
 
 revit_automatic = unwrap_dynamo_input(IN[2])
 if revit_automatic is None:
@@ -101,10 +104,20 @@ except:
 if tolerance_m <= 0:
     raise Exception("Ошибка: IN[3] должен быть больше 0.")
 
+input_node_merge_tolerance_m = IN[4] if len(IN) > 4 else None
+if input_node_merge_tolerance_m is None:
+    raise Exception("Ошибка: IN[4] (допуск склейки узлов в метрах) не задан.")
+
+try:
+    node_merge_tolerance_m = float(input_node_merge_tolerance_m)
+except:
+    raise Exception("Ошибка: IN[4] должен быть числом (метры).")
+
+if node_merge_tolerance_m <= 0:
+    raise Exception("Ошибка: IN[4] должен быть больше 0.")
+
 tolerance_ft = tolerance_m * 3.280839895
-# Отдельный допуск для склейки концов участков в узлы графа.
-# Делаем его небольшим, чтобы не "съедать" короткие участки возле щита/потребителей.
-node_merge_tolerance_ft = min(tolerance_ft, 0.0328084)  # 10 мм в футах
+node_merge_tolerance_ft = node_merge_tolerance_m * 3.280839895
 
 
 # --- ПОИСК ОБЪЕКТА ELECTRICALSYSTEM ПО НОМЕРУ ЦЕПИ ---
@@ -329,6 +342,7 @@ if not horizontal_sections:
 graph_nodes = []  # [(x, y), ...]
 graph_edges = []  # [{"id","element","length_ft","n1","n2"}, ...]
 adjacency = {}    # node_index -> [edge_index, ...]
+node_source_points = {}  # node_index -> [(x, y), ...] исходные точки, попавшие в узел
 
 
 def get_or_create_node_index(pt_xy):
@@ -341,10 +355,12 @@ def get_or_create_node_index(pt_xy):
                 nearest_dist = d
                 nearest_idx = idx
     if nearest_idx is not None:
+        node_source_points[nearest_idx].append(pt_xy)
         return nearest_idx
     graph_nodes.append(pt_xy)
     new_idx = len(graph_nodes) - 1
     adjacency[new_idx] = []
+    node_source_points[new_idx] = [pt_xy]
     return new_idx
 
 
@@ -357,10 +373,13 @@ for section in horizontal_sections:
         graph_nodes.append(section["p1_xy"])
         n2 = len(graph_nodes) - 1
         adjacency[n2] = []
+        node_source_points[n2] = [section["p1_xy"]]
     edge_data = {
         "id": section["id"],
         "element": section["element"],
         "length_ft": section["length_ft"],
+        "p0_xy": section["p0_xy"],
+        "p1_xy": section["p1_xy"],
         "n1": n1,
         "n2": n2
     }
@@ -381,6 +400,25 @@ def find_nearest_node_within_tolerance(pt_xy):
     if nearest_dist is None or nearest_dist > tolerance_ft:
         return None
     return nearest_node
+
+
+node_match_points = None
+
+
+def find_nodes_within_tolerance(pt_xy):
+    """Возвращает все узлы графа в пределах допуска привязки к потребителю."""
+    result = []
+    for idx in range(len(graph_nodes)):
+        node_pt = graph_nodes[idx]
+        if node_match_points is not None and idx < len(node_match_points) and node_match_points[idx] is not None:
+            node_pt = node_match_points[idx]
+        d = distance_xy(pt_xy, node_pt)
+        if d <= tolerance_ft:
+            result.append({
+                "node_idx": idx,
+                "dist_xy_ft": d
+            })
+    return result
 
 
 def get_nearest_node_distance_xy(pt_xy):
@@ -476,9 +514,83 @@ def restore_path_edges(target_node):
     return result
 
 
+def build_node_match_points_towards_panel():
+    """
+    Возвращает координаты узлов для привязки потребителей.
+    Для каждого узла берем точку на ребре, ведущем к щиту по prev_edge.
+    Это сохраняет "приходящий к потребителю" участок при склейке узлов по допуску.
+    """
+    match_points = []
+    for node_idx in range(len(graph_nodes)):
+        source_points = node_source_points.get(node_idx, [graph_nodes[node_idx]])
+        selected = graph_nodes[node_idx]
+
+        if node_idx == start_node:
+            # Для стартового узла берём точку, наиболее близкую к щиту.
+            selected = min(source_points, key=lambda p: distance_xy(p, panel_xy))
+        else:
+            incoming_edge_idx = prev_edge.get(node_idx)
+            if incoming_edge_idx is not None:
+                incoming_edge = graph_edges[incoming_edge_idx]
+                if incoming_edge["n1"] == node_idx:
+                    selected = incoming_edge["p0_xy"]
+                else:
+                    selected = incoming_edge["p1_xy"]
+            elif source_points:
+                selected = source_points[0]
+
+        match_points.append(selected)
+    return match_points
+
+
+def get_consumer_connection_to_graph(consumer_xy):
+    """
+    Привязка потребителя к графу:
+    - выбираем узлы в пределах допуска;
+    - если найдено несколько, берем ближайший к потребителю по XY.
+      При равенстве XY используем минимальную дистанцию до щита по графу.
+    """
+    candidate_nodes = find_nodes_within_tolerance(consumer_xy)
+    if not candidate_nodes:
+        return None
+
+    reachable = []
+    for item in candidate_nodes:
+        node_idx = item["node_idx"]
+        d_graph = dist.get(node_idx, float("inf"))
+        if d_graph != float("inf"):
+            reachable.append({
+                "node_idx": node_idx,
+                "dist_graph_ft": d_graph,
+                "dist_xy_ft": item["dist_xy_ft"]
+            })
+
+    if not reachable:
+        return None
+
+    # Главный критерий: ближайший к потребителю по XY.
+    # При равенстве — близость к щиту по графу.
+    reachable_sorted = sorted(
+        reachable,
+        key=lambda x: (x["dist_xy_ft"], x["dist_graph_ft"], x["node_idx"])
+    )
+    chosen_node = reachable_sorted[0]["node_idx"]
+
+    path_edges = restore_path_edges(chosen_node)
+    if path_edges is None and chosen_node != start_node:
+        return None
+
+    return {
+        "type": "node",
+        "path_edges": [] if path_edges is None else path_edges
+    }
+
+
 # --- ФОРМИРОВАНИЕ ОТЧЕТА ПУТЕЙ К ПОТРЕБИТЕЛЯМ ---
+node_match_points = build_node_match_points_towards_panel()
 output_lines = []
 not_found_consumers = []
+consumer_reports = []
 consumers_sorted = sorted(
     allowed_consumers,
     key=lambda x: (normalize_text(get_element_display_name(x)), x.Id.IntegerValue)
@@ -503,20 +615,20 @@ for consumer in consumers_sorted:
         })
         continue
 
-    consumer_node = find_nearest_node_within_tolerance(consumer_xy)
-    if consumer_node is None:
+    connection = get_consumer_connection_to_graph(consumer_xy)
+    if connection is None:
         not_found_consumers.append({
             "name": consumer_name,
             "id": consumer_id,
             "space_name": space_name,
             "space_number": space_number,
             "level_name": level_name,
-            "reason": "Узел трассы рядом с потребителем не найден в допуске"
+            "reason": "Узел трассы в допуске не найден или не связан со щитом"
         })
         continue
 
-    path_edge_indices = restore_path_edges(consumer_node)
-    if not path_edge_indices:
+    path_edge_indices = connection["path_edges"]
+    if path_edge_indices is None:
         not_found_consumers.append({
             "name": consumer_name,
             "id": consumer_id,
@@ -527,9 +639,10 @@ for consumer in consumers_sorted:
         })
         continue
 
-    output_lines.append("--------------------------------------------------")
-    output_lines.append("Потребитель: {} (ID {})".format(consumer_name, consumer_id))
-    output_lines.append("Маршрут: от потребителя к щиту")
+    report_lines = []
+    report_lines.append("--------------------------------------------------")
+    report_lines.append("Потребитель: {} (ID {})".format(consumer_name, consumer_id))
+    report_lines.append("Маршрут: от потребителя к щиту")
     path_sections = []
     used_section_ids = set()
 
@@ -574,12 +687,26 @@ for consumer in consumers_sorted:
             marker_text = "вертикальный у щита"
         else:
             marker_text = "участок трассы"
-        output_lines.append(
+        report_lines.append(
             "  {:>2}. ID {:<8} | {:<26} | {:>7.2f} м".format(
                 idx_in_path, sec_data["id"], marker_text, ft_to_m(sec_data["length_ft"])
             )
         )
-    output_lines.append("Итого по маршруту: {:.2f} м".format(ft_to_m(total_path_length_ft)))
+    report_lines.append("Итого по маршруту: {:.2f} м".format(ft_to_m(total_path_length_ft)))
+    consumer_reports.append({
+        "total_path_length_ft": total_path_length_ft,
+        "consumer_name_norm": normalize_text(consumer_name),
+        "consumer_id": consumer_id,
+        "lines": report_lines
+    })
+
+
+consumer_reports = sorted(
+    consumer_reports,
+    key=lambda x: (-x["total_path_length_ft"], x["consumer_name_norm"], x["consumer_id"])
+)
+for report in consumer_reports:
+    output_lines.extend(report["lines"])
 
 
 if not_found_consumers:
