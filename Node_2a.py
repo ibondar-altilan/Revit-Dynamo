@@ -16,8 +16,15 @@ from Autodesk.Revit.UI import *
 
 clr.AddReference('RevitServices')
 from RevitServices.Persistence import DocumentManager
+from RevitServices.Transactions import TransactionManager
+
+clr.AddReference('System.Windows.Forms')
+clr.AddReference('System.Drawing')
+import System.Windows.Forms
+import System.Drawing
 
 doc = DocumentManager.Instance.CurrentDBDocument
+PARAM_MAX_CABLE_LENGTH = "Длина проводника до дальнего устройства"
 
 
 def unwrap_dynamo_input(value):
@@ -197,6 +204,146 @@ def distance_xy(p1, p2):
 
 def ft_to_m(value_ft):
     return value_ft * 0.3048
+
+
+def ceil_meters(value_m):
+    if value_m <= 0.0:
+        return 0
+    return int(math.ceil(value_m - 1e-9))
+
+
+def write_max_length_to_breaker(breaker, length_m_ceil):
+    """Записывает длину в параметр автомата 'Длина проводника до дальнего устройства'."""
+    param = breaker.LookupParameter(PARAM_MAX_CABLE_LENGTH)
+    if param is None:
+        raise Exception("Параметр '{}' не найден на автомате.".format(PARAM_MAX_CABLE_LENGTH))
+    if param.IsReadOnly:
+        raise Exception("Параметр '{}' доступен только для чтения.".format(PARAM_MAX_CABLE_LENGTH))
+
+    TransactionManager.Instance.EnsureInTransaction(doc)
+    if param.StorageType == StorageType.Integer:
+        param.Set(int(length_m_ceil))
+    elif param.StorageType == StorageType.Double:
+        param.Set(float(length_m_ceil))
+    elif param.StorageType == StorageType.String:
+        param.Set(str(length_m_ceil))
+    else:
+        TransactionManager.Instance.TransactionTaskDone()
+        raise Exception(
+            "Параметр '{}' имеет неподдерживаемый тип: {}.".format(PARAM_MAX_CABLE_LENGTH, param.StorageType)
+        )
+    TransactionManager.Instance.TransactionTaskDone()
+
+
+def show_result_window(message_text, allow_write):
+    """Показывает результат поверх всех окон. Возвращает 'write' или 'exit'."""
+    if not message_text:
+        return "exit"
+
+    screen = System.Windows.Forms.Screen.FromPoint(System.Windows.Forms.Cursor.Position).WorkingArea
+    margin = 16
+    button_width = 170 if allow_write else 160
+    button_height = 32
+    button_spacing = 12
+    content_min_width = 420
+    content_max_width = int(screen.Width * 0.78)
+    max_client_width = int(screen.Width * 0.90)
+    max_client_height = int(screen.Height * 0.90)
+    text_font = System.Drawing.Font("Segoe UI", 10)
+    text_flags = System.Windows.Forms.TextFormatFlags.WordBreak
+
+    probe_size = System.Drawing.Size(content_max_width, 10000)
+    measured_probe = System.Windows.Forms.TextRenderer.MeasureText(
+        message_text, text_font, probe_size, text_flags
+    )
+    content_width = measured_probe.Width
+    if content_width < content_min_width:
+        content_width = content_min_width
+    if content_width > content_max_width:
+        content_width = content_max_width
+
+    client_width = content_width + margin * 2
+    if client_width > max_client_width:
+        client_width = max_client_width
+
+    final_content_width = client_width - margin * 2
+    measured_final = System.Windows.Forms.TextRenderer.MeasureText(
+        message_text, text_font, System.Drawing.Size(final_content_width, 10000), text_flags
+    )
+    content_height = measured_final.Height + 12
+    client_height = margin + content_height + margin + button_height + margin
+    if client_height > max_client_height:
+        client_height = max_client_height
+
+    form = System.Windows.Forms.Form()
+    form.Text = "Результат расчёта трассы"
+    form.StartPosition = System.Windows.Forms.FormStartPosition.CenterScreen
+    form.TopMost = True
+    form.FormBorderStyle = System.Windows.Forms.FormBorderStyle.FixedDialog
+    form.MaximizeBox = False
+    form.MinimizeBox = False
+    form.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Dpi
+    form.BackColor = System.Drawing.Color.White
+    form.ClientSize = System.Drawing.Size(client_width, client_height)
+
+    text_panel = System.Windows.Forms.Panel()
+    text_panel.Left = margin
+    text_panel.Top = margin
+    text_panel.Width = form.ClientSize.Width - margin * 2
+    text_panel.Height = form.ClientSize.Height - margin * 3 - button_height
+    text_panel.BackColor = System.Drawing.Color.White
+    text_panel.BorderStyle = System.Windows.Forms.BorderStyle.FixedSingle
+    text_panel.Anchor = (
+        System.Windows.Forms.AnchorStyles.Top
+        | System.Windows.Forms.AnchorStyles.Bottom
+        | System.Windows.Forms.AnchorStyles.Left
+        | System.Windows.Forms.AnchorStyles.Right
+    )
+    form.Controls.Add(text_panel)
+
+    message_label = System.Windows.Forms.Label()
+    message_label.Dock = System.Windows.Forms.DockStyle.Fill
+    message_label.AutoSize = False
+    message_label.TextAlign = System.Drawing.ContentAlignment.MiddleCenter
+    message_label.BackColor = System.Drawing.Color.White
+    message_label.ForeColor = System.Drawing.Color.Black
+    message_label.Font = text_font
+    message_label.Text = message_text
+    text_panel.Controls.Add(message_label)
+
+    btn_exit = System.Windows.Forms.Button()
+    btn_exit.Text = "Выйти без записи"
+    btn_exit.Width = button_width
+    btn_exit.Height = button_height
+    btn_exit.Top = form.ClientSize.Height - margin - btn_exit.Height
+    btn_exit.Anchor = System.Windows.Forms.AnchorStyles.Bottom
+    btn_exit.DialogResult = System.Windows.Forms.DialogResult.Cancel
+    form.Controls.Add(btn_exit)
+
+    btn_write = None
+    if allow_write:
+        btn_write = System.Windows.Forms.Button()
+        btn_write.Text = "Записать"
+        btn_write.Width = button_width
+        btn_write.Height = button_height
+        btn_write.Top = form.ClientSize.Height - margin - btn_write.Height
+        btn_write.Anchor = System.Windows.Forms.AnchorStyles.Bottom
+        btn_write.DialogResult = System.Windows.Forms.DialogResult.OK
+        form.Controls.Add(btn_write)
+        total_buttons_width = btn_write.Width + button_spacing + btn_exit.Width
+        left_start = (form.ClientSize.Width - total_buttons_width) / 2
+        btn_write.Left = left_start
+        btn_exit.Left = btn_write.Right + button_spacing
+        form.AcceptButton = btn_write
+    else:
+        btn_exit.Left = (form.ClientSize.Width - btn_exit.Width) / 2
+        form.AcceptButton = btn_exit
+
+    form.CancelButton = btn_exit
+    dialog_result = form.ShowDialog()
+    if allow_write and dialog_result == System.Windows.Forms.DialogResult.OK:
+        return "write"
+    return "exit"
 
 
 def get_element_xy_point(element):
@@ -421,6 +568,29 @@ def find_nodes_within_tolerance(pt_xy):
     return result
 
 
+def get_nearest_node_debug(pt_xy):
+    """Ближайший узел графа для отладки (индекс, дистанция, координаты)."""
+    nearest_idx = None
+    nearest_dist = None
+    nearest_pt = None
+    for idx in range(len(graph_nodes)):
+        node_pt = graph_nodes[idx]
+        if node_match_points is not None and idx < len(node_match_points) and node_match_points[idx] is not None:
+            node_pt = node_match_points[idx]
+        d = distance_xy(pt_xy, node_pt)
+        if nearest_dist is None or d < nearest_dist:
+            nearest_dist = d
+            nearest_idx = idx
+            nearest_pt = node_pt
+    if nearest_idx is None:
+        return None
+    return {
+        "node_idx": nearest_idx,
+        "dist_ft": nearest_dist,
+        "node_pt": nearest_pt
+    }
+
+
 def get_nearest_node_distance_xy(pt_xy):
     """Минимальная XY-дистанция от точки до любого узла графа."""
     nearest_dist = None
@@ -543,6 +713,29 @@ def build_node_match_points_towards_panel():
     return match_points
 
 
+def collect_component_edge_ids(start_node_idx):
+    """Собирает ID участков (ребер) связной компоненты узла."""
+    pending = [start_node_idx]
+    visited_nodes = set()
+    visited_edges = set()
+    edge_ids = set()
+    while pending:
+        node_idx = pending.pop()
+        if node_idx in visited_nodes:
+            continue
+        visited_nodes.add(node_idx)
+        for edge_idx in adjacency.get(node_idx, []):
+            if edge_idx in visited_edges:
+                continue
+            visited_edges.add(edge_idx)
+            edge = graph_edges[edge_idx]
+            edge_ids.add(edge["id"])
+            neighbor = edge["n2"] if edge["n1"] == node_idx else edge["n1"]
+            if neighbor not in visited_nodes:
+                pending.append(neighbor)
+    return sorted(list(edge_ids))
+
+
 def get_consumer_connection_to_graph(consumer_xy):
     """
     Привязка потребителя к графу:
@@ -550,9 +743,15 @@ def get_consumer_connection_to_graph(consumer_xy):
     - если найдено несколько, берем ближайший к потребителю по XY.
       При равенстве XY используем минимальную дистанцию до щита по графу.
     """
+    nearest_node_debug = get_nearest_node_debug(consumer_xy)
     candidate_nodes = find_nodes_within_tolerance(consumer_xy)
     if not candidate_nodes:
-        return None
+        return {
+            "status": "no_nodes_in_tolerance",
+            "path_edges": None,
+            "debug_nearest_node": nearest_node_debug,
+            "disconnected_edge_ids": []
+        }
 
     reachable = []
     for item in candidate_nodes:
@@ -566,7 +765,16 @@ def get_consumer_connection_to_graph(consumer_xy):
             })
 
     if not reachable:
-        return None
+        disconnected_edge_ids = []
+        for item in candidate_nodes:
+            disconnected_edge_ids.extend(collect_component_edge_ids(item["node_idx"]))
+        disconnected_edge_ids = sorted(list(set(disconnected_edge_ids)))
+        return {
+            "status": "disconnected_from_panel",
+            "path_edges": None,
+            "debug_nearest_node": nearest_node_debug,
+            "disconnected_edge_ids": disconnected_edge_ids
+        }
 
     # Главный критерий: ближайший к потребителю по XY.
     # При равенстве — близость к щиту по графу.
@@ -578,12 +786,35 @@ def get_consumer_connection_to_graph(consumer_xy):
 
     path_edges = restore_path_edges(chosen_node)
     if path_edges is None and chosen_node != start_node:
-        return None
+        return {
+            "status": "disconnected_from_panel",
+            "path_edges": None,
+            "debug_nearest_node": nearest_node_debug,
+            "disconnected_edge_ids": collect_component_edge_ids(chosen_node)
+        }
 
     return {
+        "status": "ok",
         "type": "node",
-        "path_edges": [] if path_edges is None else path_edges
+        "path_edges": [] if path_edges is None else path_edges,
+        "debug_nearest_node": nearest_node_debug,
+        "disconnected_edge_ids": []
     }
+
+
+def format_nearest_node_debug(debug_info):
+    if not debug_info:
+        return "нет данных"
+    pt = debug_info["node_pt"]
+    return (
+        "ближайший узел IDx={0}, dist={1:.3f} м, XY=({2:.3f}, {3:.3f}) м"
+        .format(
+            debug_info["node_idx"],
+            ft_to_m(debug_info["dist_ft"]),
+            ft_to_m(pt[0]),
+            ft_to_m(pt[1])
+        )
+    )
 
 
 # --- ФОРМИРОВАНИЕ ОТЧЕТА ПУТЕЙ К ПОТРЕБИТЕЛЯМ ---
@@ -616,14 +847,17 @@ for consumer in consumers_sorted:
         continue
 
     connection = get_consumer_connection_to_graph(consumer_xy)
-    if connection is None:
+    if connection["status"] != "ok":
+        disconnected_ids = connection.get("disconnected_edge_ids", [])
         not_found_consumers.append({
             "name": consumer_name,
             "id": consumer_id,
             "space_name": space_name,
             "space_number": space_number,
             "level_name": level_name,
-            "reason": "Узел трассы в допуске не найден или не связан со щитом"
+            "reason": "Узел трассы в допуске не найден или не связан со щитом",
+            "nearest_node_debug": format_nearest_node_debug(connection.get("debug_nearest_node")),
+            "disconnected_edge_ids": disconnected_ids
         })
         continue
 
@@ -695,6 +929,10 @@ for consumer in consumers_sorted:
     report_lines.append("Итого по маршруту: {:.2f} м".format(ft_to_m(total_path_length_ft)))
     consumer_reports.append({
         "total_path_length_ft": total_path_length_ft,
+        "consumer_name": consumer_name,
+        "space_name": space_name,
+        "space_number": space_number,
+        "level_name": level_name,
         "consumer_name_norm": normalize_text(consumer_name),
         "consumer_id": consumer_id,
         "lines": report_lines
@@ -713,9 +951,19 @@ if not_found_consumers:
     output_lines.append("--------------------------------------------------")
     output_lines.append("Пути не найдены для потребителей: {}".format(len(not_found_consumers)))
     for item in not_found_consumers:
+        disconnected_text = "нет"
+        if item.get("disconnected_edge_ids"):
+            disconnected_text = ", ".join([str(x) for x in item["disconnected_edge_ids"]])
         output_lines.append(
-            "  - {} (ID {}) | Пространство: {} ({}) | Уровень: {} | Причина: {}".format(
-                item["name"], item["id"], item["space_name"], item["space_number"], item["level_name"], item["reason"]
+            "  - {} (ID {}) | Пространство: {} ({}) | Уровень: {} | Причина: {} | {} | Участки связной компоненты: {}".format(
+                item["name"],
+                item["id"],
+                item["space_name"],
+                item["space_number"],
+                item["level_name"],
+                item["reason"],
+                item.get("nearest_node_debug", "ближайший узел: нет данных"),
+                disconnected_text
             )
         )
 
@@ -723,5 +971,82 @@ if not output_lines:
     output_lines = ["Не найдено потребителей разрешенных категорий с построенным путем."]
 else:
     output_lines.append("--------------------------------------------------")
+
+# --- ОТЛАДКА: КООРДИНАТЫ ВЕРШИН ГРАФА ---
+output_lines.append("Координаты вершин графа (XY, м):")
+for idx, node_pt in enumerate(graph_nodes):
+    output_lines.append(
+        "  - Узел {:>3}: X={:>10.3f} м, Y={:>10.3f} м".format(
+            idx,
+            ft_to_m(node_pt[0]),
+            ft_to_m(node_pt[1])
+        )
+    )
+
+# --- ОТЛАДКА: КООРДИНАТЫ ПРИВЯЗКИ УЗЛОВ ---
+output_lines.append("Координаты привязки узлов (node_match_points, XY, м):")
+if node_match_points is None:
+    output_lines.append("  - node_match_points не рассчитаны")
+else:
+    for idx, match_pt in enumerate(node_match_points):
+        output_lines.append(
+            "  - Узел {:>3}: X={:>10.3f} м, Y={:>10.3f} м".format(
+                idx,
+                ft_to_m(match_pt[0]),
+                ft_to_m(match_pt[1])
+            )
+        )
+
+# --- ОКНО РЕЗУЛЬТАТА ---
+result_window_text = ""
+result_can_write = False
+result_write_value_m = None
+if not not_found_consumers and consumer_reports:
+    longest = consumer_reports[0]
+    longest_len_m_ceil = ceil_meters(ft_to_m(longest["total_path_length_ft"]))
+    consumer_desc = "{}, {} ({}), {}".format(
+        longest["consumer_name"],
+        longest["space_name"],
+        longest["space_number"],
+        longest["level_name"]
+    )
+    result_window_text = (
+        "Расчёт трассы максимальной длины в цепи {0} выполнен успешно.\r\n"
+        "Максимальная длина - {1}м  до потребителя {2}"
+    ).format(circuit_number, longest_len_m_ceil, consumer_desc)
+    result_can_write = True
+    result_write_value_m = longest_len_m_ceil
+else:
+    lines = []
+    lines.append("Не найден путь к следующим потребителям:")
+    if not_found_consumers:
+        for item in not_found_consumers:
+            lines.append(
+                "{0}, {1} ({2}), {3}".format(
+                    item["name"],
+                    item["space_name"],
+                    item["space_number"],
+                    item["level_name"]
+                )
+            )
+    else:
+        lines.append("нет данных")
+    lines.append("")
+    lines.append("Проверьте допуски между участками трассы и между потребителями и концами трассы")
+    lines.append("Проверьте, что все участки трассы содержат номер цепи {0}".format(circuit_number))
+    result_window_text = "\r\n".join(lines)
+
+try:
+    result_action = show_result_window(result_window_text, result_can_write)
+    if result_action == "write" and result_can_write and result_write_value_m is not None:
+        try:
+            write_max_length_to_breaker(revit_automatic, result_write_value_m)
+        except Exception as write_exc:
+            show_result_window(
+                "Ошибка записи в параметр '{0}':\r\n{1}".format(PARAM_MAX_CABLE_LENGTH, str(write_exc)),
+                False
+            )
+except:
+    pass
 
 OUT = output_lines
