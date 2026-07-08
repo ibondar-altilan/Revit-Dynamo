@@ -158,6 +158,24 @@ def get_param_or_no_data(element, param_name):
     return value if value else "нет данных"
 
 
+# Параметры экземпляров для определения уровня (см. файл проекта "Промпт параметров Revit...")
+CONSUMER_LEVEL_PARAM_NAMES = [
+    "Уровень",               # AsValueString
+    "Уровень спецификации",  # AsValueString
+]
+
+
+def get_level_name_or_no_data(element):
+    """Определяет уровень потребителя по параметрам проекта."""
+    for param_name in CONSUMER_LEVEL_PARAM_NAMES:
+        value = get_parameter_value_string(element, param_name)
+        if value:
+            return value
+    # Fallback на старый параметр (если еще используется в проекте)
+    legacy = get_parameter_value_string(element, "TSL_Имя уровня")
+    return legacy if legacy else "нет данных"
+
+
 def distance_xy(p1, p2):
     dx = p1[0] - p2[0]
     dy = p1[1] - p2[1]
@@ -471,7 +489,7 @@ for consumer in consumers_sorted:
     consumer_id = consumer.Id.IntegerValue
     space_name = get_param_or_no_data(consumer, "TSL_Имя пространства")
     space_number = get_param_or_no_data(consumer, "TSL_Номер пространства")
-    level_name = get_param_or_no_data(consumer, "TSL_Имя уровня")
+    level_name = get_level_name_or_no_data(consumer)
 
     consumer_xy = get_element_xy_point(consumer)
     if consumer_xy is None:
