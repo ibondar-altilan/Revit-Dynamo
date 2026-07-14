@@ -79,6 +79,7 @@ ALLOWED_CONSUMER_CATEGORIES = [
     "Осветительные приборы",
     "Электрические приборы",
     "Специальное оборудование",
+    "Арматура воздуховодов",
 ]
 ALLOWED_CONSUMER_CATEGORIES_NORM = set([normalize_text(x) for x in ALLOWED_CONSUMER_CATEGORIES])
 
@@ -86,8 +87,9 @@ ALLOWED_CONSUMER_CATEGORIES_NORM = set([normalize_text(x) for x in ALLOWED_CONSU
 # --- ВХОДЫ ---
 if IN is None or len(IN) < 5:
     raise Exception(
-        "Ошибка: ожидаются входы IN[0], IN[1], IN[2], IN[3], IN[4]. "
-        "Для этапа 1 обязательны IN[2] (автомат), IN[3] (допуск привязки) и IN[4] (допуск склейки узлов)."
+        "Ошибка: ожидаются входы IN[0], IN[1], IN[2], IN[3], IN[4], IN[5]. "
+        "Обязательны IN[2] (автомат), IN[3] (допуск привязки), IN[4] (допуск склейки узлов). "
+        "IN[5] обязателен только при графах на нескольких уровнях."
     )
 
 revit_automatic = unwrap_dynamo_input(IN[2])
@@ -122,6 +124,8 @@ except:
 
 if node_merge_tolerance_m <= 0:
     raise Exception("Ошибка: IN[4] должен быть больше 0.")
+
+vertical_link_element = unwrap_dynamo_input(IN[5]) if len(IN) > 5 else None
 
 tolerance_ft = tolerance_m * 3.280839895
 node_merge_tolerance_ft = node_merge_tolerance_m * 3.280839895
@@ -465,7 +469,8 @@ for sec in sections:
             "id": sec.Id.IntegerValue,
             "length_ft": curve.Length,
             "p0_xy": (curve.GetEndPoint(0).X, curve.GetEndPoint(0).Y),
-            "p1_xy": (curve.GetEndPoint(1).X, curve.GetEndPoint(1).Y)
+            "p1_xy": (curve.GetEndPoint(1).X, curve.GetEndPoint(1).Y),
+            "level_name": get_level_name_or_no_data(sec)
         }
         horizontal_sections.append(section_data)
 
@@ -478,7 +483,8 @@ for sec in sections:
                 "id": sec.Id.IntegerValue,
                 "length_ft": curve.Length,
                 "p0_xy": (curve.GetEndPoint(0).X, curve.GetEndPoint(0).Y),
-                "p1_xy": (curve.GetEndPoint(1).X, curve.GetEndPoint(1).Y)
+                "p1_xy": (curve.GetEndPoint(1).X, curve.GetEndPoint(1).Y),
+                "level_name": get_level_name_or_no_data(sec)
             }
             vertical_sections.append(section_data)
         elif hasattr(location, "Point") and location.Point is not None:
@@ -499,62 +505,152 @@ for sec in sections:
                 "id": sec.Id.IntegerValue,
                 "length_ft": length_ft,
                 "p0_xy": (pt.X, pt.Y),
-                "p1_xy": (pt.X, pt.Y)
+                "p1_xy": (pt.X, pt.Y),
+                "level_name": get_level_name_or_no_data(sec)
             }
             vertical_sections.append(section_data)
 
 if not horizontal_sections:
     raise Exception("Ошибка: в IN[0] не найдено горизонтальных участков трассы.")
 
-# --- ПОСТРОЕНИЕ 2D ГРАФА ТРАССЫ (ТОЛЬКО XY) ---
+# --- ПОСТРОЕНИЕ 2D ГРАФОВ ТРАССЫ ПО УРОВНЯМ (ТОЛЬКО XY) ---
 graph_nodes = []  # [(x, y), ...]
 graph_edges = []  # [{"id","element","length_ft","n1","n2"}, ...]
 adjacency = {}    # node_index -> [edge_index, ...]
 node_source_points = {}  # node_index -> [(x, y), ...] исходные точки, попавшие в узел
+node_level_by_index = {}  # node_index -> level_name
+level_to_graph_nodes = {}  # level_name -> [node_index, ...]
+
+sections_by_level = {}
+for sec in horizontal_sections:
+    lvl = sec.get("level_name", "нет данных")
+    if lvl not in sections_by_level:
+        sections_by_level[lvl] = []
+    sections_by_level[lvl].append(sec)
+
+levels_with_graph = sorted(sections_by_level.keys(), key=lambda x: normalize_text(x))
+
+for level_name in levels_with_graph:
+    level_sections = sections_by_level[level_name]
+    local_nodes = []
+    local_source_points = {}
+
+    def get_or_create_local_node_index(pt_xy):
+        nearest_idx = None
+        nearest_dist = None
+        for idx, node_pt in enumerate(local_nodes):
+            d = distance_xy(pt_xy, node_pt)
+            if d <= node_merge_tolerance_ft:
+                if nearest_dist is None or d < nearest_dist:
+                    nearest_dist = d
+                    nearest_idx = idx
+        if nearest_idx is not None:
+            local_source_points[nearest_idx].append(pt_xy)
+            return nearest_idx
+        local_nodes.append(pt_xy)
+        new_idx = len(local_nodes) - 1
+        local_source_points[new_idx] = [pt_xy]
+        return new_idx
+
+    local_edges = []
+    for section in level_sections:
+        ln1 = get_or_create_local_node_index(section["p0_xy"])
+        ln2 = get_or_create_local_node_index(section["p1_xy"])
+        if ln1 == ln2:
+            local_nodes.append(section["p1_xy"])
+            ln2 = len(local_nodes) - 1
+            local_source_points[ln2] = [section["p1_xy"]]
+        local_edges.append({
+            "section": section,
+            "ln1": ln1,
+            "ln2": ln2
+        })
+
+    local_to_global = {}
+    for ln_idx, pt_xy in enumerate(local_nodes):
+        g_idx = len(graph_nodes)
+        graph_nodes.append(pt_xy)
+        adjacency[g_idx] = []
+        node_source_points[g_idx] = list(local_source_points.get(ln_idx, [pt_xy]))
+        node_level_by_index[g_idx] = level_name
+        local_to_global[ln_idx] = g_idx
+        if level_name not in level_to_graph_nodes:
+            level_to_graph_nodes[level_name] = []
+        level_to_graph_nodes[level_name].append(g_idx)
+
+    for edge_item in local_edges:
+        section = edge_item["section"]
+        n1 = local_to_global[edge_item["ln1"]]
+        n2 = local_to_global[edge_item["ln2"]]
+        edge_data = {
+            "id": section["id"],
+            "element": section["element"],
+            "length_ft": section["length_ft"],
+            "p0_xy": section["p0_xy"],
+            "p1_xy": section["p1_xy"],
+            "n1": n1,
+            "n2": n2,
+            "level_name": level_name
+        }
+        graph_edges.append(edge_data)
+        edge_index = len(graph_edges) - 1
+        adjacency[n1].append(edge_index)
+        adjacency[n2].append(edge_index)
 
 
-def get_or_create_node_index(pt_xy):
-    nearest_idx = None
-    nearest_dist = None
-    for idx, node_pt in enumerate(graph_nodes):
-        d = distance_xy(pt_xy, node_pt)
-        if d <= node_merge_tolerance_ft:
+if len(levels_with_graph) > 1:
+    if vertical_link_element is None:
+        OUT = ["Нет точки вертикальной связности"]
+        raise Exception("Нет точки вертикальной связности")
+
+    vertical_link_xy = get_element_xy_point(vertical_link_element)
+    if vertical_link_xy is None:
+        OUT = ["Нет точки вертикальной связности"]
+        raise Exception("Нет точки вертикальной связности")
+
+    level_link_nodes = {}
+    missing_levels = []
+    for level_name in levels_with_graph:
+        candidate_nodes = level_to_graph_nodes.get(level_name, [])
+        nearest_node = None
+        nearest_dist = None
+        for node_idx in candidate_nodes:
+            d = distance_xy(vertical_link_xy, graph_nodes[node_idx])
             if nearest_dist is None or d < nearest_dist:
                 nearest_dist = d
-                nearest_idx = idx
-    if nearest_idx is not None:
-        node_source_points[nearest_idx].append(pt_xy)
-        return nearest_idx
-    graph_nodes.append(pt_xy)
-    new_idx = len(graph_nodes) - 1
-    adjacency[new_idx] = []
-    node_source_points[new_idx] = [pt_xy]
-    return new_idx
+                nearest_node = node_idx
 
+        if nearest_node is None or nearest_dist > tolerance_ft:
+            missing_levels.append(level_name)
+        else:
+            level_link_nodes[level_name] = nearest_node
 
-for section in horizontal_sections:
-    n1 = get_or_create_node_index(section["p0_xy"])
-    n2 = get_or_create_node_index(section["p1_xy"])
-    if n1 == n2:
-        # Если оба конца попали в один узел из-за допуска, принудительно создаем
-        # второй узел для второго конца, чтобы короткий участок не пропал из графа.
-        graph_nodes.append(section["p1_xy"])
-        n2 = len(graph_nodes) - 1
-        adjacency[n2] = []
-        node_source_points[n2] = [section["p1_xy"]]
-    edge_data = {
-        "id": section["id"],
-        "element": section["element"],
-        "length_ft": section["length_ft"],
-        "p0_xy": section["p0_xy"],
-        "p1_xy": section["p1_xy"],
-        "n1": n1,
-        "n2": n2
-    }
-    graph_edges.append(edge_data)
-    edge_index = len(graph_edges) - 1
-    adjacency[n1].append(edge_index)
-    adjacency[n2].append(edge_index)
+    if missing_levels:
+        missing_text = ", ".join(missing_levels)
+        OUT = ["Ошибка: нет узла для вертикальной связности на уровне: {}".format(missing_text)]
+        raise Exception("Ошибка вертикальной связности по уровням: {}".format(missing_text))
+
+    base_level = levels_with_graph[0]
+    base_node = level_link_nodes[base_level]
+    for level_name in levels_with_graph[1:]:
+        target_node = level_link_nodes[level_name]
+        if target_node == base_node:
+            continue
+        link_edge = {
+            "id": "VLINK_{}_{}".format(base_level, level_name),
+            "element": vertical_link_element,
+            "length_ft": 0.0,
+            "p0_xy": graph_nodes[base_node],
+            "p1_xy": graph_nodes[target_node],
+            "n1": base_node,
+            "n2": target_node,
+            "level_name": "Межуровневый",
+            "virtual_vertical_link": True
+        }
+        graph_edges.append(link_edge)
+        link_edge_idx = len(graph_edges) - 1
+        adjacency[base_node].append(link_edge_idx)
+        adjacency[target_node].append(link_edge_idx)
 
 
 def find_nearest_node_within_tolerance(pt_xy):
@@ -914,6 +1010,8 @@ for consumer in consumers_sorted:
     # Основной путь по горизонтальным участкам: от потребителя к щиту
     for edge_idx in reversed(path_edge_indices):
         edge = graph_edges[edge_idx]
+        if edge.get("virtual_vertical_link", False):
+            continue
         sec_data = {
             "id": edge["id"],
             "length_ft": edge["length_ft"],
