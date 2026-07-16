@@ -79,7 +79,7 @@ ALLOWED_CONSUMER_CATEGORIES = [
     "Осветительные приборы",
     "Электрические приборы",
     "Специальное оборудование",
-    "Арматура воздуховодов",
+    "Электрооборудование",
 ]
 ALLOWED_CONSUMER_CATEGORIES_NORM = set([normalize_text(x) for x in ALLOWED_CONSUMER_CATEGORIES])
 
