@@ -1,7 +1,7 @@
 # Node 2
 # Назначение:
 # 1) По участкам трассы определяет целевой уровень (по геометрии Z).
-# 2) Находит подходящие планы этажа этого уровня.
+# 2) Учитывает только уровни с планами этажей FloorPlan; CeilingPlan игнорируется.
 # 3) Возвращает выбранный целевой вид (автовыбор или выбор пользователем).
 
 # -*- coding: utf-8 -*-
@@ -118,13 +118,33 @@ for item in counted_elements:
 if not z_coordinates:
     raise Exception("Ошибка: Не удалось определить геометрические координаты Z для трасс.")
 
-level_collector = FilteredElementCollector(doc).OfClass(Level).WhereElementIsNotElementType()
+# --- ШАГ 3: УРОВНИ ТОЛЬКО ПО ПЛАНАМ ЭТАЖЕЙ (FloorPlan) ---
+# Планы потолков (CeilingPlan), шаблоны и прочие ViewPlan игнорируются.
+view_collector = FilteredElementCollector(doc).OfClass(ViewPlan).WhereElementIsNotElementType()
+floor_plans_by_level_id = {}
+for view in view_collector:
+    if view.IsTemplate:
+        continue
+    if view.ViewType != ViewType.FloorPlan:
+        continue
+    if not view.GenLevel:
+        continue
+    level_id_value = view.GenLevel.Id.IntegerValue
+    if level_id_value not in floor_plans_by_level_id:
+        floor_plans_by_level_id[level_id_value] = []
+    floor_plans_by_level_id[level_id_value].append(view)
+
+if not floor_plans_by_level_id:
+    raise Exception("Ошибка: В проекте нет планов этажей (FloorPlan).")
+
 avg_trajectory_z = sum(z_coordinates) / float(len(z_coordinates))
 closest_level = None
 max_level_elevation_below = -float('inf')
-tolerance_feet = 0.328 
+tolerance_feet = 0.328
 
-for lvl in level_collector:
+for lvl in FilteredElementCollector(doc).OfClass(Level).WhereElementIsNotElementType():
+    if lvl.Id.IntegerValue not in floor_plans_by_level_id:
+        continue
     elevation = lvl.Elevation
     if elevation <= (avg_trajectory_z + tolerance_feet):
         if elevation > max_level_elevation_below:
@@ -132,22 +152,17 @@ for lvl in level_collector:
             closest_level = lvl
 
 if not closest_level:
-    raise Exception("Ошибка: Не найден уровень под отметкой трассы.")
+    raise Exception(
+        "Ошибка: Не найден уровень с планом этажа (FloorPlan) под отметкой трассы."
+    )
 
-# --- ШАГ 3: ФИЛЬТРАЦИЯ ПЛАНОВ ЭТАЖЕЙ ---
-view_collector = FilteredElementCollector(doc).OfClass(ViewPlan).WhereElementIsNotElementType()
-found_views = []
-pre_selected_view = None 
-
-for view in view_collector:
-    if view.IsTemplate or view.ViewType != ViewType.FloorPlan: continue
-    if view.GenLevel and view.GenLevel.Id == closest_level.Id:
-        found_views.append(view)
-        
-        if desired_view_id_value is not None and view.Id.IntegerValue == desired_view_id_value:
-            pre_selected_view = view
-        elif desired_view_name and view.Name.strip().lower() == desired_view_name:
-            pre_selected_view = view
+found_views = list(floor_plans_by_level_id[closest_level.Id.IntegerValue])
+pre_selected_view = None
+for view in found_views:
+    if desired_view_id_value is not None and view.Id.IntegerValue == desired_view_id_value:
+        pre_selected_view = view
+    elif desired_view_name and view.Name.strip().lower() == desired_view_name:
+        pre_selected_view = view
 
 if not found_views:
     raise Exception(f"Ошибка: Нет планов этажей для уровня '{closest_level.Name}'.")

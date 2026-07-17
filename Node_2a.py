@@ -1048,13 +1048,16 @@ def format_nearest_node_debug(debug_info):
     if not debug_info:
         return "нет данных"
     pt = debug_info["node_pt"]
+    node_idx = debug_info["node_idx"]
+    linked_to_panel = dist.get(node_idx, float("inf")) != float("inf")
     return (
-        "ближайший узел IDx={0}, dist={1:.3f} м, XY=({2:.3f}, {3:.3f}) м"
+        "ближайший узел IDx={0}, dist={1:.3f} м, XY=({2:.3f}, {3:.3f}) м, связан со щитом={4}"
         .format(
-            debug_info["node_idx"],
+            node_idx,
             ft_to_m(debug_info["dist_ft"]),
             ft_to_m(pt[0]),
-            ft_to_m(pt[1])
+            ft_to_m(pt[1]),
+            "да" if linked_to_panel else "нет"
         )
     )
 
@@ -1091,13 +1094,20 @@ for consumer in consumers_sorted:
     connection = get_consumer_connection_to_graph(consumer_xy, level_name)
     if connection["status"] != "ok":
         disconnected_ids = connection.get("disconnected_edge_ids", [])
+        status = connection.get("status", "")
+        if status == "no_nodes_in_tolerance":
+            reason_text = "Узел трассы в допуске не найден (на уровне потребителя)"
+        elif status == "disconnected_from_panel":
+            reason_text = "Узел трассы в допуске есть, но не связан со щитом"
+        else:
+            reason_text = "Узел трассы в допуске не найден или не связан со щитом"
         not_found_consumers.append({
             "name": consumer_name,
             "id": consumer_id,
             "space_name": space_name,
             "space_number": space_number,
             "level_name": level_name,
-            "reason": "Узел трассы в допуске не найден или не связан со щитом",
+            "reason": reason_text,
             "nearest_node_debug": format_nearest_node_debug(connection.get("debug_nearest_node")),
             "disconnected_edge_ids": disconnected_ids
         })
@@ -1232,14 +1242,20 @@ else:
     output_lines.append("--------------------------------------------------")
 
 # --- ОТЛАДКА: КООРДИНАТЫ ВЕРШИН ГРАФА ---
-output_lines.append("Координаты вершин графа (XY, м):")
+output_lines.append(
+    "Координаты вершин графа (XY, м) | старт щита=узел {} | связан со щитом: да/нет:".format(
+        start_node
+    )
+)
 for idx, node_pt in enumerate(graph_nodes):
+    linked_to_panel = dist.get(idx, float("inf")) != float("inf")
     output_lines.append(
-        "  - Узел {:>3}: X={:>10.3f} м, Y={:>10.3f} м | уровень={}".format(
+        "  - Узел {:>3}: X={:>10.3f} м, Y={:>10.3f} м | уровень={} | связан со щитом={}".format(
             idx,
             ft_to_m(node_pt[0]),
             ft_to_m(node_pt[1]),
-            node_level_by_index.get(idx, "нет данных")
+            node_level_by_index.get(idx, "нет данных"),
+            "да" if linked_to_panel else "нет"
         )
     )
 
