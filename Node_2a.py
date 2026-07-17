@@ -187,17 +187,62 @@ CONSUMER_LEVEL_PARAM_NAMES = [
     "Уровень",               # AsValueString
     "Уровень спецификации",  # AsValueString
 ]
+LEVEL_MATCH_TOLERANCE_FT = 0.328  # ~100 мм, как в Node_2
+
+
+def get_element_z_coordinate(element):
+    """Z элемента без BoundingBox (совместимо с CPython3)."""
+    if element is None:
+        return None
+    location = element.Location
+    if location:
+        if hasattr(location, "Point") and location.Point is not None:
+            return location.Point.Z
+        if hasattr(location, "Curve") and location.Curve is not None:
+            c = location.Curve
+            return (c.GetEndPoint(0).Z + c.GetEndPoint(1).Z) / 2.0
+    if hasattr(element, "Origin") and element.Origin is not None:
+        return element.Origin.Z
+    return None
+
+
+def get_nearest_level_name_by_z(z_ft):
+    """Ближайший снизу уровень по Z (с допуском на точное равенство)."""
+    if z_ft is None:
+        return None
+    closest_level = None
+    max_elevation_below = -float("inf")
+    for lvl in FilteredElementCollector(doc).OfClass(Level).WhereElementIsNotElementType():
+        elevation = lvl.Elevation
+        if elevation <= (z_ft + LEVEL_MATCH_TOLERANCE_FT) and elevation >= max_elevation_below:
+            max_elevation_below = elevation
+            closest_level = lvl
+    return closest_level.Name if closest_level is not None else None
+
+
+def levels_match(level_a, level_b):
+    return normalize_text(level_a) == normalize_text(level_b)
 
 
 def get_level_name_or_no_data(element):
-    """Определяет уровень потребителя по параметрам проекта."""
+    """Определяет уровень по параметрам, LevelId или геометрии Z."""
     for param_name in CONSUMER_LEVEL_PARAM_NAMES:
         value = get_parameter_value_string(element, param_name)
         if value:
             return value
-    # Fallback на старый параметр (если еще используется в проекте)
     legacy = get_parameter_value_string(element, "TSL_Имя уровня")
-    return legacy if legacy else "нет данных"
+    if legacy:
+        return legacy
+    try:
+        if hasattr(element, "LevelId") and element.LevelId and element.LevelId != ElementId.InvalidElementId:
+            lvl = doc.GetElement(element.LevelId)
+            if lvl is not None and getattr(lvl, "Name", None):
+                return lvl.Name
+    except:
+        pass
+    z_ft = get_element_z_coordinate(element)
+    level_by_z = get_nearest_level_name_by_z(z_ft)
+    return level_by_z if level_by_z else "нет данных"
 
 
 def distance_xy(p1, p2):
@@ -608,6 +653,8 @@ if len(levels_with_graph) > 1:
         OUT = ["Нет точки вертикальной связности"]
         raise Exception("Нет точки вертикальной связности")
 
+    # Единственная межуровневая связка: только через точку IN[5].
+    # Совпадение XY вершин на разных уровнях НЕ создаёт рёбер.
     level_link_nodes = {}
     missing_levels = []
     for level_name in levels_with_graph:
@@ -651,13 +698,27 @@ if len(levels_with_graph) > 1:
         link_edge_idx = len(graph_edges) - 1
         adjacency[base_node].append(link_edge_idx)
         adjacency[target_node].append(link_edge_idx)
+else:
+    vertical_link_xy = None
+    level_link_nodes = {}
 
 
-def find_nearest_node_within_tolerance(pt_xy):
+def iter_graph_node_indices(level_name=None):
+    """Узлы графа; при level_name — только узлы этого уровня."""
+    if level_name is None:
+        for idx in range(len(graph_nodes)):
+            yield idx
+        return
+    for idx, node_level in node_level_by_index.items():
+        if levels_match(node_level, level_name):
+            yield idx
+
+
+def find_nearest_node_within_tolerance(pt_xy, level_name=None):
     nearest_node = None
     nearest_dist = None
-    for idx, node_pt in enumerate(graph_nodes):
-        d = distance_xy(pt_xy, node_pt)
+    for idx in iter_graph_node_indices(level_name):
+        d = distance_xy(pt_xy, graph_nodes[idx])
         if nearest_dist is None or d < nearest_dist:
             nearest_dist = d
             nearest_node = idx
@@ -669,10 +730,10 @@ def find_nearest_node_within_tolerance(pt_xy):
 node_match_points = None
 
 
-def find_nodes_within_tolerance(pt_xy):
+def find_nodes_within_tolerance(pt_xy, level_name=None):
     """Возвращает все узлы графа в пределах допуска привязки к потребителю."""
     result = []
-    for idx in range(len(graph_nodes)):
+    for idx in iter_graph_node_indices(level_name):
         node_pt = graph_nodes[idx]
         if node_match_points is not None and idx < len(node_match_points) and node_match_points[idx] is not None:
             node_pt = node_match_points[idx]
@@ -685,12 +746,12 @@ def find_nodes_within_tolerance(pt_xy):
     return result
 
 
-def get_nearest_node_debug(pt_xy):
+def get_nearest_node_debug(pt_xy, level_name=None):
     """Ближайший узел графа для отладки (индекс, дистанция, координаты)."""
     nearest_idx = None
     nearest_dist = None
     nearest_pt = None
-    for idx in range(len(graph_nodes)):
+    for idx in iter_graph_node_indices(level_name):
         node_pt = graph_nodes[idx]
         if node_match_points is not None and idx < len(node_match_points) and node_match_points[idx] is not None:
             node_pt = node_match_points[idx]
@@ -708,11 +769,11 @@ def get_nearest_node_debug(pt_xy):
     }
 
 
-def get_nearest_node_distance_xy(pt_xy):
+def get_nearest_node_distance_xy(pt_xy, level_name=None):
     """Минимальная XY-дистанция от точки до любого узла графа."""
     nearest_dist = None
-    for node_pt in graph_nodes:
-        d = distance_xy(pt_xy, node_pt)
+    for idx in iter_graph_node_indices(level_name):
+        d = distance_xy(pt_xy, graph_nodes[idx])
         if nearest_dist is None or d < nearest_dist:
             nearest_dist = d
     return nearest_dist
@@ -724,11 +785,21 @@ def get_section_point_distance_xy(section_data, pt_xy):
     return min(d1, d2)
 
 
+def element_matches_circuit(element):
+    """Проверка, что участок относится к текущей цепи."""
+    if element is None:
+        return False
+    tsl_circuit = get_parameter_value_string(element, "TSL_Номер питающей цепи")
+    return target_circuit_number in normalize_text(tsl_circuit)
+
+
 def get_nearest_vertical_section_near_point(pt_xy, excluded_ids):
     nearest_section = None
     nearest_dist = None
     for sec_data in vertical_sections:
         if sec_data["id"] in excluded_ids:
+            continue
+        if not element_matches_circuit(sec_data["element"]):
             continue
         d = get_section_point_distance_xy(sec_data, pt_xy)
         if d <= tolerance_ft and (nearest_dist is None or d < nearest_dist):
@@ -737,11 +808,64 @@ def get_nearest_vertical_section_near_point(pt_xy, excluded_ids):
     return nearest_section
 
 
+# Вертикальные участки в точке связности уровней (для длины маршрута)
+vertical_link_sections = []
+if len(levels_with_graph) > 1 and vertical_link_xy is not None:
+    seen_link_section_ids = set()
+    for sec_data in vertical_sections:
+        if sec_data["id"] in seen_link_section_ids:
+            continue
+        if get_section_point_distance_xy(sec_data, vertical_link_xy) > tolerance_ft:
+            continue
+        if not element_matches_circuit(sec_data["element"]):
+            continue
+        vertical_link_sections.append(sec_data)
+        seen_link_section_ids.add(sec_data["id"])
+
+    # IN[5] тоже учитываем, если это участок нужной цепи и его ещё нет в списке
+    if vertical_link_element is not None and element_matches_circuit(vertical_link_element):
+        link_id = vertical_link_element.Id.IntegerValue
+        if link_id not in seen_link_section_ids:
+            link_xy = get_element_xy_point(vertical_link_element)
+            if link_xy is not None and distance_xy(link_xy, vertical_link_xy) <= tolerance_ft:
+                length_ft = 0.0
+                location = vertical_link_element.Location
+                if location and hasattr(location, "Curve") and location.Curve is not None:
+                    length_ft = location.Curve.Length
+                else:
+                    length_param = vertical_link_element.LookupParameter("Длина")
+                    if length_param and length_param.HasValue:
+                        try:
+                            if length_param.StorageType == StorageType.Double:
+                                length_ft = length_param.AsDouble()
+                            else:
+                                length_ft = float(length_param.AsValueString())
+                        except:
+                            length_ft = 0.0
+                vertical_link_sections.append({
+                    "element": vertical_link_element,
+                    "id": link_id,
+                    "length_ft": length_ft,
+                    "p0_xy": link_xy,
+                    "p1_xy": link_xy,
+                    "level_name": get_level_name_or_no_data(vertical_link_element)
+                })
+                seen_link_section_ids.add(link_id)
+
+
 panel_xy = get_element_xy_point(panel)
 if panel_xy is None:
     raise Exception("Ошибка: не удалось определить XY-координаты щита '{}'.".format(panel_name_from_automatic))
 
-start_node = find_nearest_node_within_tolerance(panel_xy)
+panel_level_name = get_level_name_or_no_data(panel)
+start_node = find_nearest_node_within_tolerance(panel_xy, panel_level_name)
+if start_node is None:
+    panel_level_by_z = get_nearest_level_name_by_z(get_element_z_coordinate(panel))
+    if panel_level_by_z and not levels_match(panel_level_by_z, panel_level_name):
+        start_node = find_nearest_node_within_tolerance(panel_xy, panel_level_by_z)
+if start_node is None:
+    # Последний fallback: если имя уровня щита не совпало с уровнями трассы.
+    start_node = find_nearest_node_within_tolerance(panel_xy)
 if start_node is None:
     raise Exception(
         "Трасса {} не подключена к щиту {}".format(circuit_number, panel_name_from_automatic)
@@ -853,15 +977,16 @@ def collect_component_edge_ids(start_node_idx):
     return sorted(list(edge_ids))
 
 
-def get_consumer_connection_to_graph(consumer_xy):
+def get_consumer_connection_to_graph(consumer_xy, consumer_level_name=None):
     """
     Привязка потребителя к графу:
-    - выбираем узлы в пределах допуска;
+    - выбираем узлы своего уровня в пределах допуска;
     - если найдено несколько, берем ближайший к потребителю по XY.
       При равенстве XY используем минимальную дистанцию до щита по графу.
+    Межуровневый переход возможен только через виртуальное ребро IN[5].
     """
-    nearest_node_debug = get_nearest_node_debug(consumer_xy)
-    candidate_nodes = find_nodes_within_tolerance(consumer_xy)
+    nearest_node_debug = get_nearest_node_debug(consumer_xy, consumer_level_name)
+    candidate_nodes = find_nodes_within_tolerance(consumer_xy, consumer_level_name)
     if not candidate_nodes:
         return {
             "status": "no_nodes_in_tolerance",
@@ -963,7 +1088,7 @@ for consumer in consumers_sorted:
         })
         continue
 
-    connection = get_consumer_connection_to_graph(consumer_xy)
+    connection = get_consumer_connection_to_graph(consumer_xy, level_name)
     if connection["status"] != "ok":
         disconnected_ids = connection.get("disconnected_edge_ids", [])
         not_found_consumers.append({
@@ -1007,10 +1132,23 @@ for consumer in consumers_sorted:
         })
         used_section_ids.add(consumer_vertical["id"])
 
-    # Основной путь по горизонтальным участкам: от потребителя к щиту
+    # Основной путь по горизонтальным участкам: от потребителя к щиту.
+    # При межуровневом переходе добавляем вертикальные участки точки связности IN[5].
+    vertical_link_added = False
     for edge_idx in reversed(path_edge_indices):
         edge = graph_edges[edge_idx]
         if edge.get("virtual_vertical_link", False):
+            if not vertical_link_added:
+                for vsec in vertical_link_sections:
+                    if vsec["id"] in used_section_ids:
+                        continue
+                    path_sections.append({
+                        "id": vsec["id"],
+                        "length_ft": vsec["length_ft"],
+                        "marker": "связность"
+                    })
+                    used_section_ids.add(vsec["id"])
+                vertical_link_added = True
             continue
         sec_data = {
             "id": edge["id"],
@@ -1038,6 +1176,8 @@ for consumer in consumers_sorted:
             marker_text = "вертикальный у потребителя"
         elif marker == "щит":
             marker_text = "вертикальный у щита"
+        elif marker == "связность":
+            marker_text = "вертикальный связности уровней"
         else:
             marker_text = "участок трассы"
         report_lines.append(
@@ -1095,12 +1235,44 @@ else:
 output_lines.append("Координаты вершин графа (XY, м):")
 for idx, node_pt in enumerate(graph_nodes):
     output_lines.append(
-        "  - Узел {:>3}: X={:>10.3f} м, Y={:>10.3f} м".format(
+        "  - Узел {:>3}: X={:>10.3f} м, Y={:>10.3f} м | уровень={}".format(
             idx,
             ft_to_m(node_pt[0]),
-            ft_to_m(node_pt[1])
+            ft_to_m(node_pt[1]),
+            node_level_by_index.get(idx, "нет данных")
         )
     )
+
+if len(levels_with_graph) > 1:
+    output_lines.append(
+        "Межуровневая связка IN[5]: XY=({:.3f}, {:.3f}) м".format(
+            ft_to_m(vertical_link_xy[0]),
+            ft_to_m(vertical_link_xy[1])
+        )
+    )
+    for level_name in levels_with_graph:
+        link_node = level_link_nodes.get(level_name)
+        if link_node is None:
+            continue
+        pt = graph_nodes[link_node]
+        output_lines.append(
+            "  - уровень '{}': узел {} XY=({:.3f}, {:.3f}) м".format(
+                level_name,
+                link_node,
+                ft_to_m(pt[0]),
+                ft_to_m(pt[1])
+            )
+        )
+    if vertical_link_sections:
+        output_lines.append("Вертикальные участки связности в расчёте длины:")
+        for vsec in vertical_link_sections:
+            output_lines.append(
+                "  - ID {} | {:.2f} м".format(vsec["id"], ft_to_m(vsec["length_ft"]))
+            )
+    else:
+        output_lines.append(
+            "Вертикальные участки связности в расчёте длины: нет (проверьте номер цепи)"
+        )
 
 # --- ОТЛАДКА: КООРДИНАТЫ ПРИВЯЗКИ УЗЛОВ ---
 output_lines.append("Координаты привязки узлов (node_match_points, XY, м):")
